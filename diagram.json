@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "author": "Projeto Balança Nutricional IoT",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-hx711",
+      "id": "hx711",
+      "top": -160,
+      "left": 260,
+      "attrs": { "type": "5kg" }
+    },
+    {
+      "type": "wokwi-dht22",
+      "id": "dht1",
+      "top": 40,
+      "left": 300,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_pullup",
+      "top": 10,
+      "left": 420,
+      "attrs": { "value": "10000" }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer1",
+      "top": 170,
+      "left": 260,
+      "attrs": { "volume": "0.2" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 230,
+      "left": 420,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_led",
+      "top": 230,
+      "left": 360,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo1",
+      "top": -60,
+      "left": 420,
+      "attrs": { "horn": "single" }
+    }
+  ],
+  "connections": [
+    [ "esp:3V3", "hx711:VCC", "red", [] ],
+    [ "esp:GND.1", "hx711:GND", "black", [] ],
+    [ "esp:D4", "hx711:SCK", "green", [] ],
+    [ "esp:D19", "hx711:DT", "blue", [] ],
+
+    [ "esp:3V3", "dht1:VCC", "red", [] ],
+    [ "esp:GND.1", "dht1:GND", "black", [] ],
+    [ "esp:D15", "dht1:SDA", "green", [] ],
+    [ "dht1:VCC", "r_pullup:1", "red", [] ],
+    [ "r_pullup:2", "dht1:SDA", "yellow", [] ],
+
+    [ "esp:D25", "buzzer1:2", "green", [] ],
+    [ "buzzer1:1", "esp:GND.2", "black", [] ],
+
+    [ "esp:D26", "r_led:1", "green", [] ],
+    [ "r_led:2", "led1:A", "green", [] ],
+    [ "led1:C", "esp:GND.2", "black", [] ],
+
+    [ "servo1:GND", "esp:GND.2", "black", [] ],
+    [ "servo1:V+", "esp:VIN", "red", [] ],
+    [ "servo1:PWM", "esp:D13", "green", [] ]
+  ],
+  "dependencies": {}
+}

@@ -1,6 +1,7 @@
 /* =========================================================================
-   BALANÇA NUTRICIONAL IoT — ESP32 + Wokwi + Blynk IoT (via MQTT)
-   Versão para PlatformIO (src/main.cpp)
+   BALANÇA NUTRICIONAL IoT — ESP32 + Wokwi + MQTT (broker público)
+   Versão 2: SEM Blynk. Os dados são consumidos por um app WEB (HTML/CSS/JS)
+   e por um app MOBILE (React Native / Expo) que se conectam ao MESMO broker.
    =========================================================================
 
    SENSORES (2):
@@ -11,21 +12,36 @@
    ATUADORES (2):
      1) Buzzer + LED vermelho — AUTOMÁTICO (regra de negócio)
         Dispara sozinho quando:
-          a) o total de calorias do dia ultrapassa a meta da dieta, OU
-          b) a temperatura ambiente ultrapassa 30 °C (risco de o
-             alimento estragar)
+          a) a porção sobre a balança ultrapassa LIMITE_PESO_PORCAO, OU
+          b) a temperatura ambiente ultrapassa LIMITE_TEMPERATURA
      2) Servo motor — MANUAL
-        Abre/fecha a "tampa inteligente" do recipiente. É controlado
-        exclusivamente pelo usuário, através de um Switch no dashboard
-        do Blynk (datastream TampaManual).
+        Abre/fecha a "tampa inteligente" do recipiente. Só se move quando
+        o usuário envia o comando pelo app web ou pelo app mobile.
 
-   COMUNICAÇÃO: MQTT puro, usando a Device MQTT API oficial da Blynk.Cloud
-   (NÃO é a biblioteca Blynk.h clássica — aqui falamos MQTT de verdade
-   com a lib PubSubClient, publicando/assinando os tópicos documentados
-   em https://docs.blynk.io/en/blynk.cloud-mqtt-api/device-mqtt-api)
+   COMUNICAÇÃO: MQTT (biblioteca PubSubClient) em um broker público.
+   Todos os tópicos ficam sob  balanca-nutricional/<PROJECT_ID>/...
 
-     Publicar dado do dispositivo p/ nuvem:  ds/<NomeDoDatastream>
-     Receber alterações vindas do app:       downlink/ds/<NomeDoDatastream>
+     ESP32 -> apps (telemetria, publicada com retain):
+       .../peso                     peso em gramas
+       .../calorias/refeicao        kcal do alimento que está no prato
+       .../calorias/dia             kcal acumuladas no dia
+       .../meta/progresso           % da meta diária já consumida
+       .../ambiente/temperatura     °C
+       .../ambiente/umidade         %
+       .../alarme/status            0 = normal, 1 = alarme ativo
+       .../alarme/motivo            nenhum | porcao | temperatura | porcao+temperatura
+       .../tampa/estado             0 = fechada, 1 = aberta
+       .../config/alimento          0 = Arroz, 1 = Frango, 2 = Ovo
+       .../config/meta              meta calórica diária (kcal)
+       .../config/limite_peso       limite de porção (g)
+       .../config/limite_temperatura  limite de temperatura (°C)
+       .../status                   online | offline (Last Will do MQTT)
+
+     apps -> ESP32 (comandos):
+       .../cmd/alimento             0, 1 ou 2           (retain)
+       .../cmd/meta                 100 a 10000 kcal    (retain)
+       .../cmd/tampa                0 = fechar, 1 = abrir (retain)
+       .../cmd/resetar              1 = zerar calorias do dia
 
    ========================================================================= */
 
@@ -34,9 +50,8 @@
 #include "HX711.h"
 #include <ESP32Servo.h>
 #include "DHTesp.h"
-// A documentação oficial do Wokwi recomenda especificamente esta biblioteca
-// pra ler o wokwi-dht22 a partir de um ESP32 (outras podem não funcionar de
-// forma confiável com esse componente simulado neste microcontrolador):
+// A documentação oficial do Wokwi recomenda especificamente a DHTesp para
+// ler o wokwi-dht22 a partir de um ESP32:
 // https://docs.wokwi.com/parts/wokwi-dht22
 
 // --------------------------- REDE (Wokwi) ---------------------------------
@@ -44,21 +59,39 @@ const char* WIFI_SSID     = "Wokwi-GUEST";   // rede virtual do Wokwi
 const char* WIFI_PASSWORD = "";              // sem senha
 const int   WIFI_CHANNEL  = 6;               // acelera a conexão no Wokwi
 
-// --------------------------- BLYNK (MQTT) ----------------------------------
-// Documentação: https://docs.blynk.io/en/blynk.cloud-mqtt-api/device-mqtt-api
-const int   MQTT_PORT   = 1883;              // porta MQTT sem TLS (mais simples p/ Wokwi)
-const char* MQTT_USER   = "device";          // literal, exigido pela Blynk
-const char* BLYNK_AUTH_TOKEN = "q8L7CDpRZ_C2D_5otnqua3YqgvaS9-MD";
-const char* MQTT_CLIENT_ID   = "ESP32-BalancaNutricional";
+// --------------------------- MQTT (broker público) --------------------------
+const char* MQTT_SERVER = "broker.hivemq.com";   // alternativa: "broker.emqx.io"
+const int   MQTT_PORT   = 1883;                  // MQTT sem TLS (TCP)
 
-// A Blynk.Cloud pode pedir pra gente trocar de servidor (GeoDNS, servidor
-// regional mais próximo) logo após conectar, via mensagem downlink/redirect.
-// A própria documentação da Blynk avisa que IGNORAR isso pode fazer o
-// dispositivo não conseguir trocar dados direito e aparecer como "Offline"
-// — foi exatamente esse sintoma que você teve.
-char mqttServerAtual[64] = "blynk.cloud";
-char novoServidorPendente[64] = "";
-bool precisaRedirecionar = false;
+// >>> TROQUE por um texto único seu (letras/números, sem espaços nem "/").
+// >>> Use EXATAMENTE o mesmo valor em web/config.js e mobile/config.js.
+// O broker é público: quem souber esse ID enxerga e comanda a sua balança.
+#define PROJECT_ID  "bn7k2q9"
+
+#define BASE_TOPIC       "balanca-nutricional/" PROJECT_ID
+#define MQTT_CLIENT_ID   "esp32-balanca-" PROJECT_ID
+
+// Telemetria (ESP32 -> apps)
+#define T_PESO            BASE_TOPIC "/peso"
+#define T_CAL_REFEICAO    BASE_TOPIC "/calorias/refeicao"
+#define T_CAL_DIA         BASE_TOPIC "/calorias/dia"
+#define T_PROGRESSO       BASE_TOPIC "/meta/progresso"
+#define T_TEMPERATURA     BASE_TOPIC "/ambiente/temperatura"
+#define T_UMIDADE         BASE_TOPIC "/ambiente/umidade"
+#define T_ALARME_STATUS   BASE_TOPIC "/alarme/status"
+#define T_ALARME_MOTIVO   BASE_TOPIC "/alarme/motivo"
+#define T_TAMPA_ESTADO    BASE_TOPIC "/tampa/estado"
+#define T_CFG_ALIMENTO    BASE_TOPIC "/config/alimento"
+#define T_CFG_META        BASE_TOPIC "/config/meta"
+#define T_CFG_LIM_PESO    BASE_TOPIC "/config/limite_peso"
+#define T_CFG_LIM_TEMP    BASE_TOPIC "/config/limite_temperatura"
+#define T_STATUS          BASE_TOPIC "/status"
+
+// Comandos (apps -> ESP32)
+#define T_CMD_ALIMENTO    BASE_TOPIC "/cmd/alimento"
+#define T_CMD_META        BASE_TOPIC "/cmd/meta"
+#define T_CMD_TAMPA       BASE_TOPIC "/cmd/tampa"
+#define T_CMD_RESETAR     BASE_TOPIC "/cmd/resetar"
 
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
@@ -89,33 +122,33 @@ Alimento tabelaAlimentos[3] = {
 };
 
 // ------------------------------- ESTADO ---------------------------------------
-int   alimentoSelecionado = 0;       // V0 - vindo do Dropdown do Blynk
-float metaCalorica        = 2000.0;  // V9 - meta diária (kcal), ajustável no app
-float caloriasDoDia       = 0.0;     // V3 - acumulado do dia
+int   alimentoSelecionado = 0;       // escolhido no app (cmd/alimento)
+float metaCalorica        = 2000.0;  // meta diária (kcal), ajustável no app
+float caloriasDoDia       = 0.0;     // acumulado do dia
 bool  pratoOcupado         = false;   // controla quando somar uma nova refeição
-bool  tampaAberta          = false;   // V8 - estado atual do servo
+bool  tampaAberta          = false;   // estado atual do servo
 
 unsigned long ultimaLeitura = 0;
 const unsigned long INTERVALO_LEITURA = 3000; // lê/envia a cada 3 segundos
 
-// Limite de peso considerado uma porção excessiva (g). Usado pelo ATUADOR 1
-// (automático) — diferente de metaCalorica, este valor reage em tempo real
-// ao peso ATUAL sobre a balança, então o alarme liga e desliga sozinho
-// conforme você tira/coloca peso, em vez de ficar "travado" ligado.
-const float LIMITE_PESO_PORCAO = 300.0;
+// Limites usados pela regra automática do ATUADOR 1 (e publicados para os
+// apps, que só os exibem — a decisão é sempre tomada aqui no ESP32).
+const float LIMITE_PESO_PORCAO = 300.0;   // g
+const float LIMITE_TEMPERATURA = 30.0;    // °C
+
+// Controle da comunicação
+bool forcarLeitura = false;          // true = processa/publica já, sem esperar 3 s
+bool configPendente = false;         // true = falta publicar o estado inicial
+unsigned long instanteConexao = 0;
 
 // ===============================================================================
-// PROTÓTIPOS DE FUNÇÃO
-// Necessário no PlatformIO: diferente do Arduino IDE (que gera isso sozinho
-// para arquivos .ino), um arquivo .cpp "puro" exige que toda função usada
-// antes de ser definida no arquivo seja declarada aqui primeiro.
+// PROTÓTIPOS DE FUNÇÃO (necessários em arquivos .cpp do PlatformIO)
 // ===============================================================================
 void conectarWiFi();
 void reconectarMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
-void publicarBlynkBatch(float peso, float caloriasAtual, float caloriasDia,
-                         float metaProgresso, float temperatura, float umidade,
-                         int alarmeStatus);
+void publicar(const char* topico, const String& valor, bool retido = true);
+void publicarConfig();
 void processarSensoresEEnviar();
 void bipManual(int pin, int freqHz, int duracaoMs);
 
@@ -145,28 +178,25 @@ void setup() {
 
   conectarWiFi();
 
-  mqtt.setServer(mqttServerAtual, MQTT_PORT);
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
 }
 
 // ===============================================================================
 void loop() {
   if (WiFi.status() != WL_CONNECTED) conectarWiFi();
-
-  // Se o servidor pediu redirecionamento (GeoDNS), troca e reconecta
-  if (precisaRedirecionar) {
-    precisaRedirecionar = false;
-    strncpy(mqttServerAtual, novoServidorPendente, sizeof(mqttServerAtual));
-    mqtt.disconnect();
-    mqtt.setServer(mqttServerAtual, MQTT_PORT);
-    Serial.print(">> Reconectando no servidor regional: ");
-    Serial.println(mqttServerAtual);
-  }
-
   if (!mqtt.connected()) reconectarMQTT();
   mqtt.loop();
 
-  if (millis() - ultimaLeitura >= INTERVALO_LEITURA) {
+  // Logo após conectar, o broker entrega os últimos comandos guardados (retain).
+  // Esperamos um instante para aplicá-los e só então publicamos o estado.
+  if (configPendente && millis() - instanteConexao > 1500) {
+    configPendente = false;
+    publicarConfig();
+  }
+
+  if (forcarLeitura || millis() - ultimaLeitura >= INTERVALO_LEITURA) {
+    forcarLeitura = false;
     ultimaLeitura = millis();
     processarSensoresEEnviar();
   }
@@ -189,34 +219,28 @@ void conectarWiFi() {
 // ------------------------------- MQTT -------------------------------------------
 void reconectarMQTT() {
   while (!mqtt.connected()) {
-    Serial.print("Conectando ao Blynk via MQTT...");
-    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, BLYNK_AUTH_TOKEN)) {
+    Serial.print("Conectando ao broker MQTT...");
+    // Last Will: se o ESP32 cair sem avisar, o broker publica "offline" em T_STATUS
+    if (mqtt.connect(MQTT_CLIENT_ID, nullptr, nullptr, T_STATUS, 0, true, "offline")) {
       Serial.println(" ok!");
-
-      // Assina TODAS as mensagens que a Blynk manda para o dispositivo
-      // (mudanças de widgets, ping, redirect, etc.)
-      mqtt.subscribe("downlink/#");
-
-      // Pede o valor atual dos datastreams de entrada, para sincronizar
-      // caso o ESP32 tenha reiniciado e o app já tenha valores salvos.
-      mqtt.publish("get/ds", "Alimento,MetaCalorica,TampaManual");
-
+      mqtt.publish(T_STATUS, "online", true);
+      mqtt.subscribe(BASE_TOPIC "/cmd/#");   // recebe todos os comandos dos apps
+      configPendente = true;
+      instanteConexao = millis();
     } else {
       Serial.print(" falhou (rc=");
       Serial.print(mqtt.state());
       Serial.println("), tentando de novo em 3s...");
-      Serial.println("Dica: confira o AUTH TOKEN e, se persistir, tente");
-      Serial.println("trocar MQTT_SERVER pelo servidor regional mostrado");
-      Serial.println("na aba 'Info' do seu device no console da Blynk.");
       delay(3000);
     }
   }
 }
 
-// Executado toda vez que chega uma mensagem MQTT vinda do Blynk
+// Executado toda vez que chega um comando MQTT vindo dos apps
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
   String t = String(topic);
 
   Serial.print("MQTT [");
@@ -224,66 +248,58 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("] -> ");
   Serial.println(msg);
 
-  // Servidor pediu pra trocar de endpoint (GeoDNS) — extrai só o host da
-  // URI (ex: "mqtt://ny3.blynk.cloud:1883") e sinaliza pro loop() trocar,
-  // mantendo nossa porta 1883 sem TLS.
-  if (t == "downlink/redirect") {
-    int hostStart = msg.indexOf("://");
-    if (hostStart >= 0) {
-      hostStart += 3;
-      int hostEnd = msg.indexOf(':', hostStart);
-      if (hostEnd < 0) hostEnd = msg.indexOf('/', hostStart);
-      if (hostEnd < 0) hostEnd = msg.length();
-      String host = msg.substring(hostStart, hostEnd);
-      host.toCharArray(novoServidorPendente, sizeof(novoServidorPendente));
-      precisaRedirecionar = true;
-      Serial.print(">> Blynk pediu redirecionamento para: ");
-      Serial.println(novoServidorPendente);
-    }
-    return;
-  }
-
-  // V0 - Dropdown "Alimento" (0=Arroz, 1=Frango, 2=Ovo)
-  if (t == "downlink/ds/Alimento") {
+  // Dropdown de alimento (0=Arroz, 1=Frango, 2=Ovo)
+  if (t == T_CMD_ALIMENTO) {
     int v = msg.toInt();
-    alimentoSelecionado = (v >= 0 && v <= 2) ? v : 0;
+    if (v >= 0 && v <= 2) {
+      alimentoSelecionado = v;
+      publicar(T_CFG_ALIMENTO, String(alimentoSelecionado));
+      forcarLeitura = true;
+    }
   }
 
-  // V9 - meta calórica ajustável pelo app
-  else if (t == "downlink/ds/MetaCalorica") {
-    metaCalorica = msg.toFloat();
+  // Meta calórica diária
+  else if (t == T_CMD_META) {
+    float v = msg.toFloat();
+    if (v >= 100 && v <= 10000) {
+      metaCalorica = v;
+      publicar(T_CFG_META, String(metaCalorica, 0));
+      forcarLeitura = true;
+    }
   }
 
-  // V8 - ATUADOR 2 (MANUAL): Switch que abre/fecha a tampa (servo)
-  else if (t == "downlink/ds/TampaManual") {
+  // ATUADOR 2 (MANUAL): abre/fecha a tampa (servo)
+  else if (t == T_CMD_TAMPA) {
     tampaAberta = (msg.toInt() == 1);
     tampa.write(tampaAberta ? 90 : 0);
+    publicar(T_TAMPA_ESTADO, tampaAberta ? "1" : "0");
     Serial.println(tampaAberta ? ">> Tampa ABERTA (comando manual)"
                                 : ">> Tampa FECHADA (comando manual)");
   }
 
-  // V10 - botão opcional para reiniciar o acumulado do dia (uso em demonstração)
-  else if (t == "downlink/ds/ResetarDia") {
+  // Zera o acumulado do dia (uso em demonstração / novo dia)
+  else if (t == T_CMD_RESETAR) {
     if (msg.toInt() == 1) {
       caloriasDoDia = 0;
+      forcarLeitura = true;
       Serial.println(">> Total de calorias do dia foi zerado.");
     }
   }
 }
 
-// Publica VÁRIOS datastreams de uma vez só, em uma única mensagem MQTT
-// (tópico batch_ds da Blynk), reduzindo o número de mensagens enviadas
-// por ciclo de 7 para 1.
-void publicarBlynkBatch(float peso, float caloriasAtual, float caloriasDia,
-                         float metaProgresso, float temperatura, float umidade,
-                         int alarmeStatus) {
-  char payload[220];
-  snprintf(payload, sizeof(payload),
-    "{\"Peso\":%.2f,\"CaloriasAtual\":%.2f,\"CaloriasDia\":%.2f,"
-    "\"MetaProgresso\":%.2f,\"Temperatura\":%.2f,\"Umidade\":%.2f,"
-    "\"AlarmeStatus\":%d}",
-    peso, caloriasAtual, caloriasDia, metaProgresso, temperatura, umidade, alarmeStatus);
-  mqtt.publish("batch_ds", payload);
+// Publica um valor (retain = true por padrão: quem abrir o app depois já
+// recebe o último valor, sem esperar o próximo ciclo)
+void publicar(const char* topico, const String& valor, bool retido) {
+  mqtt.publish(topico, valor.c_str(), retido);
+}
+
+// Estado e configurações que não mudam a cada ciclo
+void publicarConfig() {
+  publicar(T_CFG_ALIMENTO, String(alimentoSelecionado));
+  publicar(T_CFG_META, String(metaCalorica, 0));
+  publicar(T_CFG_LIM_PESO, String(LIMITE_PESO_PORCAO, 0));
+  publicar(T_CFG_LIM_TEMP, String(LIMITE_TEMPERATURA, 0));
+  publicar(T_TAMPA_ESTADO, tampaAberta ? "1" : "0");
 }
 
 // ------------------------- LÓGICA PRINCIPAL DO PROJETO ---------------------------
@@ -320,8 +336,7 @@ void processarSensoresEEnviar() {
   TempAndHumidity leituraDht = dhtSensor.getTempAndHumidity();
   float temperatura = leituraDht.temperature;
   float umidade      = leituraDht.humidity;
-  // A DHTesp não usa NAN para indicar falha (diferente da lib Adafruit) —
-  // o jeito certo de checar é via getStatus().
+  // A DHTesp não usa NAN para indicar falha — o jeito certo de checar é getStatus().
   bool leituraDhtOk = (dhtSensor.getStatus() == DHTesp::ERROR_NONE);
 
   if (!leituraDhtOk) {
@@ -334,31 +349,38 @@ void processarSensoresEEnviar() {
   // ============== ATUADOR 1 (AUTOMÁTICO) — regra de negócio ==============
   // Reage ao peso ATUAL (não ao acumulado do dia), por isso é totalmente
   // reversível: liga sozinho ao ultrapassar o limite, desliga sozinho ao
-  // voltar pra baixo dele. O acumulado do dia (caloriasDoDia/metaCalorica)
-  // continua sendo mostrado no dashboard (V3/V4), só não controla mais
-  // o buzzer/LED diretamente.
+  // voltar pra baixo dele.
   bool porcaoExcessiva = peso > LIMITE_PESO_PORCAO;
-  bool temperaturaAlta = temperatura > 30.0;
+  bool temperaturaAlta = temperatura > LIMITE_TEMPERATURA;
   bool alarmeAtivo     = porcaoExcessiva || temperaturaAlta;
 
+  const char* motivoAlarme = (porcaoExcessiva && temperaturaAlta) ? "porcao+temperatura"
+                           : porcaoExcessiva ? "porcao"
+                           : temperaturaAlta ? "temperatura"
+                           : "nenhum";
+
   digitalWrite(LED_ALARME, alarmeAtivo ? HIGH : LOW);
-  // Usamos um bipe "na unha" (digitalWrite alternado, sem tone()/LEDC) de
-  // propósito: no ESP32, a função tone() e a biblioteca Servo disputam o
-  // mesmo periférico de PWM internamente. Usar tone() "rouba" o canal da
-  // Servo e trava o motor até a placa ser reiniciada — era esse o motivo
-  // da tampa parar de responder depois do primeiro alarme. Um simples
-  // digitalWrite constante resolvia o conflito, mas o buzzer é um piezo
-  // passivo: só faz som com uma tensão oscilando, não com nível fixo.
+  // Bipe "na unha" (digitalWrite alternado, sem tone()/LEDC): no ESP32 a função
+  // tone() e a biblioteca Servo disputam o mesmo periférico de PWM, e usar
+  // tone() travaria a tampa. O buzzer é um piezo passivo: só faz som com uma
+  // tensão oscilando, por isso o nível fixo não bastaria.
   if (alarmeAtivo) {
     bipManual(BUZZER_PIN, 2000, 150); // bipe de ~150ms a 2kHz
   } else {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // ============== Envio dos dados para o Blynk (MQTT) ==============
-  // Tudo em UMA mensagem só (batch_ds), em vez de 7 separadas.
-  publicarBlynkBatch(peso, caloriasRefeicao, caloriasDoDia, progresso,
-                      temperatura, umidade, alarmeAtivo ? 1 : 0);
+  // ============== Envio dos dados para os apps (MQTT) ==============
+  publicar(T_PESO,          String(peso, 2));
+  publicar(T_CAL_REFEICAO,  String(caloriasRefeicao, 2));
+  publicar(T_CAL_DIA,       String(caloriasDoDia, 2));
+  publicar(T_PROGRESSO,     String(progresso, 2));
+  if (leituraDhtOk) {        // não publica lixo se o sensor falhou
+    publicar(T_TEMPERATURA, String(temperatura, 2));
+    publicar(T_UMIDADE,     String(umidade, 2));
+  }
+  publicar(T_ALARME_STATUS, alarmeAtivo ? "1" : "0");
+  publicar(T_ALARME_MOTIVO, motivoAlarme);
 
   // ============== Log no Serial Monitor ==============
   Serial.println("---------------------------------------------------");
@@ -378,8 +400,7 @@ void processarSensoresEEnviar() {
 
 // Gera um bipe alternando o pino manualmente (sem usar tone()/LEDC), pra
 // nunca disputar o hardware de PWM com a Servo. Bloqueia pelo tempo do
-// bipe (bem curto, alguns milissegundos), o que é aceitável já que roda
-// só uma vez por ciclo de leitura.
+// bipe (bem curto), o que é aceitável já que roda só uma vez por ciclo.
 void bipManual(int pin, int freqHz, int duracaoMs) {
   unsigned long periodoUs = 1000000UL / freqHz;
   unsigned long meioPeriodoUs = periodoUs / 2;

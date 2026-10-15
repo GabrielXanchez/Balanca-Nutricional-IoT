@@ -1,0 +1,2 @@
+#define BLYNK_TEMPLATE_NAME "Balanca Nutricional IoT"
+#define BLYNK_AUTH_TOKEN "q8L7CDpRZ_C2D_5otnqua3YqgvaS9-MD"
